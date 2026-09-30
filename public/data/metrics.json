@@ -1,0 +1,238 @@
+{
+  "n": 432,
+  "touch": 293,
+  "touch_pct": 67.82407407407408,
+  "hit04": 223,
+  "hit04_pct": 51.620370370370374,
+  "hit04_given_touch": 76.10921501706484,
+  "inval_first": 68,
+  "avg_mfe": 0.4994362578337103,
+  "avg_mae": -0.16307744601594468,
+  "payoff": 3.0625710055876065,
+  "avg_exp": 1.322102981438647,
+  "median_exp": 1.2531925938923383,
+  "buy": 223,
+  "sell": 209,
+  "model": "wolfe",
+  "dev": 0.55,
+  "extra": "wedge=classic tsym=0 atr=2.5 sess=0 imp=0.6",
+  "classic": true,
+  "tsym": false,
+  "atr_cap": 2.5,
+  "sess": false,
+  "imp": 0.6,
+  "rank": 0.7568509088860248,
+  "name": "Wolfe 1-2-3-4 symmetry",
+  "min_move": 0.4,
+  "half_ratio": 0.22,
+  "bars": 78008,
+  "from": "2025-09-23T09:35:00",
+  "to": "2026-09-28T09:35:00",
+  "split": "2026-05-01",
+  "monthly": {
+    "2025-09": {
+      "n": 10,
+      "touch": 6,
+      "hit": 6,
+      "hit_given_touch": 100.0
+    },
+    "2025-10": {
+      "n": 43,
+      "touch": 30,
+      "hit": 20,
+      "hit_given_touch": 66.7
+    },
+    "2025-11": {
+      "n": 32,
+      "touch": 21,
+      "hit": 11,
+      "hit_given_touch": 52.4
+    },
+    "2025-12": {
+      "n": 28,
+      "touch": 19,
+      "hit": 11,
+      "hit_given_touch": 57.9
+    },
+    "2026-01": {
+      "n": 23,
+      "touch": 17,
+      "hit": 12,
+      "hit_given_touch": 70.6
+    },
+    "2026-02": {
+      "n": 16,
+      "touch": 10,
+      "hit": 6,
+      "hit_given_touch": 60.0
+    },
+    "2026-03": {
+      "n": 41,
+      "touch": 34,
+      "hit": 22,
+      "hit_given_touch": 64.7
+    },
+    "2026-04": {
+      "n": 27,
+      "touch": 15,
+      "hit": 12,
+      "hit_given_touch": 80.0
+    },
+    "2026-05": {
+      "n": 23,
+      "touch": 17,
+      "hit": 11,
+      "hit_given_touch": 64.7
+    },
+    "2026-06": {
+      "n": 44,
+      "touch": 32,
+      "hit": 25,
+      "hit_given_touch": 78.1
+    },
+    "2026-07": {
+      "n": 73,
+      "touch": 56,
+      "hit": 39,
+      "hit_given_touch": 69.6
+    },
+    "2026-08": {
+      "n": 39,
+      "touch": 19,
+      "hit": 10,
+      "hit_given_touch": 52.6
+    },
+    "2026-09": {
+      "n": 33,
+      "touch": 17,
+      "hit": 11,
+      "hit_given_touch": 64.7
+    }
+  },
+  "is": {
+    "n": 220,
+    "touch": 152,
+    "touch_pct": 69.0909090909091,
+    "hit04": 110,
+    "hit04_pct": 50.0,
+    "hit04_given_touch": 72.36842105263158,
+    "inval_first": 37,
+    "avg_mfe": 0.4556793409288651,
+    "avg_mae": -0.17862277475420688,
+    "payoff": 2.5510707778215895,
+    "avg_exp": 1.2561711801353277,
+    "median_exp": 1.208110475095131,
+    "buy": 118,
+    "sell": 102
+  },
+  "oos": {
+    "n": 212,
+    "touch": 141,
+    "touch_pct": 66.50943396226415,
+    "hit04": 113,
+    "hit04_pct": 53.301886792452834,
+    "hit04_given_touch": 80.1418439716312,
+    "inval_first": 31,
+    "avg_mfe": 0.5466068349226213,
+    "avg_mae": -0.1463193611349812,
+    "payoff": 3.7357109181085786,
+    "avg_exp": 1.3905227752439775,
+    "median_exp": 1.3093673415460472,
+    "buy": 105,
+    "sell": 107
+  },
+  "baseline_abcd": {
+    "n": 2922,
+    "touch": 2053,
+    "touch_pct": 70.26009582477755,
+    "hit04": 1474,
+    "hit04_pct": 50.444900752908964,
+    "hit04_given_touch": 71.79736970287385,
+    "inval_first": 509,
+    "avg_mfe": 0.5061475497300993,
+    "avg_mae": -0.14976983813857817,
+    "payoff": 3.3795025488494823,
+    "avg_exp": 1.7776606664892345,
+    "median_exp": 1.6017384990241468,
+    "buy": 1469,
+    "sell": 1453,
+    "model": "abcd",
+    "dev": 0.6,
+    "extra": "harmonic D=C+AB",
+    "is": {
+      "n": 1499,
+      "touch": 1038,
+      "touch_pct": 69.24616410940627,
+      "hit04": 710,
+      "hit04_pct": 47.36490993995998,
+      "hit04_given_touch": 68.40077071290945,
+      "inval_first": 282,
+      "avg_mfe": 0.48187619861757086,
+      "avg_mae": -0.16001787022429353,
+      "payoff": 3.0113899025286086,
+      "avg_exp": 1.7462855990193031,
+      "median_exp": 1.587357954545443,
+      "buy": 753,
+      "sell": 746
+    },
+    "oos": {
+      "n": 1423,
+      "touch": 1015,
+      "touch_pct": 71.32817990161631,
+      "hit04": 764,
+      "hit04_pct": 53.68938861560084,
+      "hit04_given_touch": 75.27093596059113,
+      "inval_first": 227,
+      "avg_mfe": 0.5309688920501038,
+      "avg_mae": -0.13928958463614216,
+      "payoff": 3.811978429235194,
+      "avg_exp": 1.8107114227347914,
+      "median_exp": 1.6196877710320856,
+      "buy": 716,
+      "sell": 707
+    },
+    "rank": 0.7505431975749208
+  },
+  "notes": {
+    "touch": "price later visited the projected buy/sell rectangle",
+    "hit04": "after touch, price moved \u22650.4% in the predicted direction before a close through the far edge"
+  },
+  "families": [
+    {
+      "model": "wolfe",
+      "label": "Wolfe wedge 1-2-3-4",
+      "n": 432,
+      "hit04_given_touch": 76.1,
+      "touch_pct": 67.8,
+      "hit04_pct": 51.6,
+      "oos_hit": 80.1,
+      "oos_n": 212,
+      "payoff": 3.06,
+      "note": "\u043a\u043b\u0430\u0441\u0441\u0438\u0447\u0435\u0441\u043a\u0438\u0439 \u043a\u043b\u0438\u043d, ATR\u22642.5, \u0438\u043c\u043f\u0443\u043b\u044c\u0441 \u22650.60%"
+    },
+    {
+      "model": "abcd",
+      "label": "ABCD (\u043e\u0440\u0438\u0433\u0438\u043d\u0430\u043b V2.6)",
+      "n": 2922,
+      "hit04_given_touch": 71.7,
+      "touch_pct": 71.3,
+      "hit04_pct": 53.7,
+      "oos_hit": 75.3,
+      "oos_n": 1423,
+      "payoff": 2.12,
+      "note": "3 \u043f\u0438\u0432\u043e\u0442\u0430, D=C+AB \u2014 \u043d\u0435 \u0412\u043e\u043b\u044c\u0444, \u0441\u043b\u0438\u0448\u043a\u043e\u043c \u0448\u0443\u043c\u043d\u043e \u043d\u0430 \u0433\u0440\u0430\u0444\u0438\u043a\u0435"
+    },
+    {
+      "model": "line_test",
+      "label": "\u0422\u0435\u0441\u0442 \u043b\u0438\u043d\u0438\u0438 1\u20133",
+      "n": 340,
+      "hit04_given_touch": 61.3,
+      "touch_pct": 90.9,
+      "hit04_pct": 55.7,
+      "oos_hit": 61.3,
+      "oos_n": 176,
+      "payoff": 0,
+      "note": "\u0437\u043e\u043d\u0430 \u0442\u043e\u043b\u044c\u043a\u043e \u043a\u043e\u0433\u0434\u0430 \u0446\u0435\u043d\u0430 \u0443\u0436\u0435 \u043a\u043e\u0441\u043d\u0443\u043b\u0430\u0441\u044c 1\u20133"
+    }
+  ]
+}

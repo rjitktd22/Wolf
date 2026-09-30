@@ -1,0 +1,43 @@
+{
+  "url": "http://127.0.0.1:8081/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "NVTK Wolfe Desk",
+      "hasCanvas": false,
+      "bodyTextLen": 63,
+      "bodyTextHash": "536aeda641fbbe0b077e00ebd9b9b16131c85b97f6ef5ca1239222dd0d16460b",
+      "bodyTextPrefix": "WOLFE DESK Читаю NVTK… 78 тысяч 5-минутных баров и зоны Вульфа.",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "NVTK Wolfe Desk",
+      "hasCanvas": false,
+      "bodyTextLen": 63,
+      "bodyTextHash": "536aeda641fbbe0b077e00ebd9b9b16131c85b97f6ef5ca1239222dd0d16460b",
+      "bodyTextPrefix": "WOLFE DESK Читаю NVTK… 78 тысяч 5-минутных баров и зоны Вульфа.",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-built-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-built.json",
+  "divergesFromBaseline": true,
+  "baselineReasons": [
+    "desktop: canvas disappeared",
+    "desktop: body text collapsed (2063 -> 63 chars)",
+    "mobile: canvas disappeared",
+    "mobile: body text collapsed (1903 -> 63 chars)"
+  ]
+}

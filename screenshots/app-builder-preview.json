@@ -1,0 +1,39 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "NVTK Wolfe Desk",
+      "hasCanvas": true,
+      "bodyTextLen": 2063,
+      "bodyTextHash": "66caa70b7e3d1e10213b4939986e9ad7572c34a5a008e08dfc3c1a0a579ad502",
+      "bodyTextPrefix": "WOLFE DESK NVTK 1 048,4 -0.1% 5 минут · 23.09.2025 – 28.09.2026 ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "NVTK Wolfe Desk",
+      "hasCanvas": true,
+      "bodyTextLen": 1903,
+      "bodyTextHash": "121f0ed7503c2a2958deeb8f50ea13707a9e0458cab195f9927b443df5b397f7",
+      "bodyTextPrefix": "WOLFE DESK NVTK 1 048,4 -0.1% 5 минут · 23.09.2025 – 28.09.2026 ",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [
+    "BRAND WARNING: this looks like a game/canvas app but src/lib/og/site.json is missing \"type\": \"x:game\". X uses og:type=x:game to present the unfurl as a game card — set it in /workspace/src/lib/og/site.json per /workspace/.grok/skills/og/SKILL.md. Do not invent x:type or overload twitter:card as the game signal.",
+    "BRAND WARNING: this looks like a game/canvas app but /workspace/public/x-banner.jpg is missing. Games need a 50:11 X feed card (1200×264 JPEG) at public/x-banner.jpg — open /workspace/.grok/skills/og/SKILL.md and finish the brand-asset pass."
+  ],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}

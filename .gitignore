@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build
+dist/
+build/
+.output/
+.vercel/
+.tanstack/
+
+# Env
+.env
+.env.*
+!.env.example
+.app-env.json
+.grok/app-env.json
+.grok/preview.log
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Misc
+*.local
+.cache/

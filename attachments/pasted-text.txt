@@ -1,0 +1,1309 @@
+# -*- coding: utf-8 -*-
+"""
+NVTK ProfitGate-like Backtest V2.6 — ABCD / ZigZag, causal, LONG only
+=====================================================================
+ИСТОРИЯ ВЕРСИЙ:
+  V2.2: касание зоны свечой любого цвета; бычье подтверждение на ТРИГГЕР-баре;
+        invalidation по CLOSE; age/volume фильтры отключены.
+  V2.3: трейлинг-стоп по MFE; scratch не считается убытком для кулдауна.
+  V2.4: глубокое касание (нижняя половина зоны); триггер на возврате entry_mid;
+        TRAIL_BACK_PCT 0.20; MIN_TRIGGER_CLOSE_LOCATION 0.40.
+  V2.5: разделение исполнения стопов: hard (зонный) — внутрибарно,
+        soft (BE/трейлинг) — только по закрытию бара.
+  V2.6: (на основе длинного прогона 01.09-23.09, 54 сделки)
+        - УБРАН плоский BE (USE_BREAKEVEN=False): он создал кластер из 14 сделок
+          "нулевой монетизации" (MFE 0.40-0.50 -> выход ~0.00).
+        - ТРЕЙЛИНГ с MFE >= 0.30 (было 0.50), отступ до TP1 = 0.15 (было 0.20):
+          монетизирует малые движения вместо нулей.
+        - ПОСЛЕ TP1 раннер защищается БОЛЕЕ ШИРОКИМ трейлингом (0.25) с floor=BE:
+          даёт раннеру дышать до EXIT-зоны, но не уйти в минус.
+        - MAX_ATR_RATIO = 2.50: запрет входа в экстремальной волатильности
+          (краховые дни, где mean-reversion не работает -> серия invalidation).
+"""
+
+import os
+import sys
+import re
+import logging
+from collections import Counter
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+
+import numpy as np
+import pandas as pd
+import pytz
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+from t_tech.invest import CandleInterval, Client
+from tenacity import retry, wait_exponential, stop_after_attempt
+
+
+# ======================================================================
+# НАСТРОЙКИ
+# ======================================================================
+
+TICKER = "NVTK"
+FIGI = "BBG00475KKY8"
+
+MSK_TZ = pytz.timezone("Europe/Moscow")
+UTC_TZ = pytz.UTC
+TEST_YEAR = 2026
+
+CANDLE_INTERVAL = CandleInterval.CANDLE_INTERVAL_5_MIN
+BAR_MINUTES = 5
+
+# ----------------------------------------------------------------------
+# ZigZag / ProfitGate-like
+# ----------------------------------------------------------------------
+DEVIATION_PCT = 0.60
+ZONE_HALF_WIDTH_RATIO = 0.20
+EXIT_EXTENSION_RATIO = 0.40
+
+MIN_EXPECTED_MOVE_PCT = 0.80
+MIN_EXPECTED_MOVE_BUFFER_PCT = 0.00
+MIN_REWARD_RISK = 1.00
+
+# ----------------------------------------------------------------------
+# V2.x: КАЧЕСТВО ВХОДА И СОПРОВОЖДЕНИЕ
+# ----------------------------------------------------------------------
+REQUIRE_BULLISH_CANDLE = False     # касание зоны — свечой любого цвета
+REQUIRE_BULLISH_TRIGGER = True     # подтверждение — бычий ТРИГГЕР-бар
+MIN_TRIGGER_CLOSE_LOCATION = 0.40  # close в верхней 60% диапазона
+
+CRASH_ROC_BARS = 6
+CRASH_ROC_LIMIT_PCT = -1.50
+ZONE_MAX_AGE_MIN = 0               # 0 = фильтр возраста отключён
+
+USE_BUY_STOP_ENTRY = True
+BUY_STOP_EXPIRY_BARS = 12          # 60 мин
+ALLOW_PENDING_REPLACE = True
+
+USE_DEEP_TOUCH = True              # только нижняя половина зоны
+
+USE_ATR_STOP_BUFFER = True
+ATR_STOP_MULTIPLIER = 1.0          # НЕ ужесточать: MAE показал верный калибр
+
+USE_TP1 = True
+TP1_PCT = 0.80
+USE_PARTIAL_TP = True
+TP1_WEIGHT = 0.5
+
+# ---- V2.6: сопровождение позиции -------------------------------------
+USE_BREAKEVEN = False          # V2.6: плоский BE выключен (кластер нулей)
+BREAKEVEN_TRIGGER_PCT = 0.40   # оставлено только для A/B-сравнения
+
+USE_TRAILING_STOP = True
+TRAIL_TRIGGER_PCT = 0.30       # V2.6: было 0.50 — трейлинг с малого MFE
+TRAIL_BACK_PCT = 0.15          # V2.6: было 0.20 (close-исполнение безопасно)
+RUNNER_TRAIL_BACK_PCT = 0.25   # V2.6: после TP1 раннер дышит шире
+
+LOSS_EPS_PCT = -0.05           # scratch не убыток для кулдауна
+LOSS_COOLDOWN_BARS = 12        # 60 мин после РЕАЛЬНОГО убытка
+
+# ----------------------------------------------------------------------
+# Подтверждение разворота
+# ----------------------------------------------------------------------
+USE_BOUNCE_CONFIRMATION = True
+MIN_VOLUME_RATIO = 0.00            # 0 = объёмный фильтр отключён
+MIN_ATR_RATIO = 0.80
+MAX_ATR_RATIO = 2.50               # V2.6: нет входа в экстремальной волатильности
+ATR_PERIOD = 14
+ATR_MEDIAN_PERIOD = 50
+VOLUME_MEDIAN_PERIOD = 20
+
+USE_ZONE_INVALIDATION = True
+STOP_BUFFER_PCT = 0.05
+
+MAX_VISIBLE_ZONES = 12
+WARMUP_DAYS = 7
+ENTRY_MODE = "ZONE_TOUCH"
+
+MAX_HOLD_MINUTES = 180
+MAX_HOLD_BARS = MAX_HOLD_MINUTES // BAR_MINUTES
+
+MIN_DISTANCE_MINUTES = 30
+MIN_DISTANCE_BARS = max(1, MIN_DISTANCE_MINUTES // BAR_MINUTES)
+
+LONG_ONLY = True
+TARGET_FIRST = True
+
+# ----------------------------------------------------------------------
+# Реальные издержки
+# ----------------------------------------------------------------------
+COMMISSION_PCT_PER_SIDE = 0.03
+SLIPPAGE_PCT_PER_SIDE = 0.01
+SPREAD_PCT_PER_SIDE = 0.015
+
+# ----------------------------------------------------------------------
+# График
+# ----------------------------------------------------------------------
+SHOW_BUY_ZONES = True
+SHOW_SELL_ZONES = True
+SHOW_PROJECTION_LINES = True
+SHOW_ENTRY_TARGET_LINES = True
+SAVE_PNG = True
+SAVE_CSV = True
+
+
+# ======================================================================
+# ЛОГ
+# ======================================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+
+for name in ["tinkoff", "t_tech", "grpc", "urllib3", "asyncio", "tenacity"]:
+    logging.getLogger(name).setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+
+# ======================================================================
+# ДИАГНОСТИЧЕСКИЙ СЧЁТЧИК ОТКАЗОВ
+# ======================================================================
+
+REJECT_COUNTER = Counter()
+
+
+# ======================================================================
+# СТРУКТУРЫ
+# ======================================================================
+
+@dataclass
+class Pivot:
+    time: pd.Timestamp
+    price: float
+    kind: str
+    confirmed_time: pd.Timestamp
+
+
+@dataclass
+class Zone:
+    zone_id: int
+    a_time: pd.Timestamp
+    a_price: float
+    b_time: pd.Timestamp
+    b_price: float
+    c_time: pd.Timestamp
+    c_price: float
+    c_confirmed_time: pd.Timestamp
+
+    d_price: float
+    entry_low: float
+    entry_high: float
+    entry_mid: float
+
+    exit_center: float
+    exit_low: float
+    exit_high: float
+
+    direction: str
+    impulse_ab: float
+    move_from_entry_pct: float
+
+    broken_time: Optional[pd.Timestamp] = None
+    used: bool = False
+
+
+# ======================================================================
+# ВВОД ПЕРИОДА
+# ======================================================================
+
+def ask_period():
+    while True:
+        raw = input(
+            "\nВведите диапазон 2026 года (DD.MM-DD.MM), например 01.01-20.09: "
+        ).strip()
+
+        match = re.fullmatch(r"(\d{2})\.(\d{2})-(\d{2})\.(\d{2})", raw)
+        if not match:
+            print("❌ Формат: DD.MM-DD.MM")
+            continue
+
+        d1, m1, d2, m2 = map(int, match.groups())
+
+        try:
+            start = MSK_TZ.localize(datetime(TEST_YEAR, m1, d1, 0, 0, 0))
+            end = MSK_TZ.localize(datetime(TEST_YEAR, m2, d2, 23, 59, 59))
+        except ValueError as exc:
+            print(f"❌ Некорректная дата: {exc}")
+            continue
+
+        if start >= end:
+            print("❌ Начало должно быть раньше конца.")
+            continue
+
+        return start, end
+
+
+# ======================================================================
+# API
+# ======================================================================
+
+TOKEN = "t.1_HQzp_gl7SVfbLTYiERZPExZowowV2U8mPYgZLC9qel3znyc1xKxIF-2yk9I0tSymXUtlUlLxLf2iL6ePuMaA"
+
+
+@retry(
+    wait=wait_exponential(multiplier=1, min=2, max=8),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+def fetch_chunk(figi, from_time, to_time):
+    with Client(TOKEN) as client:
+        response = client.get_all_candles(
+            figi=figi,
+            from_=from_time,
+            to=to_time,
+            interval=CANDLE_INTERVAL,
+        )
+        return list(response)
+
+
+def load_history(figi, start_time, end_time, chunk_minutes=180):
+    candles = []
+    current = start_time
+
+    while current < end_time:
+        chunk_end = min(current + timedelta(minutes=chunk_minutes), end_time)
+
+        logger.info(
+            "⬇️ %s → %s",
+            current.astimezone(MSK_TZ).strftime("%Y-%m-%d %H:%M"),
+            chunk_end.astimezone(MSK_TZ).strftime("%Y-%m-%d %H:%M"),
+        )
+
+        try:
+            chunk = fetch_chunk(figi, current, chunk_end)
+            candles.extend(chunk)
+            logger.info("   получено: %d свечей", len(chunk))
+        except Exception as exc:
+            logger.error("Ошибка API-чанка: %s", exc)
+
+        current = chunk_end
+
+    return candles
+
+
+# ======================================================================
+# DATAFRAME
+# ======================================================================
+
+def quotation_to_float(q):
+    return float(q.units) + float(q.nano) / 1e9
+
+
+def candles_to_df(candles):
+    if not candles:
+        return pd.DataFrame()
+
+    rows = []
+
+    for candle in candles:
+        timestamp = candle.time
+
+        if timestamp.tzinfo is None:
+            timestamp = UTC_TZ.localize(timestamp)
+        else:
+            timestamp = timestamp.astimezone(UTC_TZ)
+
+        timestamp = timestamp.astimezone(MSK_TZ)
+
+        rows.append(
+            {
+                "time": timestamp,
+                "open": quotation_to_float(candle.open),
+                "high": quotation_to_float(candle.high),
+                "low": quotation_to_float(candle.low),
+                "close": quotation_to_float(candle.close),
+                "volume": int(candle.volume),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+
+    if df.empty:
+        return df
+
+    df = (
+        df.sort_values("time")
+        .drop_duplicates(subset=["time"], keep="last")
+        .set_index("time")
+    )
+
+    return df
+
+
+# ======================================================================
+# ПОДТВЕРЖДАЮЩИЕ ПРИЗНАКИ NVTK
+# ======================================================================
+
+def add_confirmation_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    prev_close = out["close"].shift(1)
+
+    tr1 = out["high"] - out["low"]
+    tr2 = (out["high"] - prev_close).abs()
+    tr3 = (out["low"] - prev_close).abs()
+
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    out["atr"] = true_range.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
+
+    out["atr_median_prev"] = (
+        out["atr"].rolling(ATR_MEDIAN_PERIOD, min_periods=ATR_MEDIAN_PERIOD)
+        .median().shift(1)
+    )
+    out["atr_ratio"] = out["atr"] / out["atr_median_prev"]
+
+    out["volume_median_prev"] = (
+        out["volume"].rolling(VOLUME_MEDIAN_PERIOD, min_periods=VOLUME_MEDIAN_PERIOD)
+        .median().shift(1)
+    )
+    out["volume_ratio"] = out["volume"] / out["volume_median_prev"]
+
+    return out
+
+
+# ======================================================================
+# CAUSAL ZIGZAG
+# ======================================================================
+
+def build_causal_zigzag(df: pd.DataFrame, deviation_pct: float) -> List[Pivot]:
+    if df.empty or len(df) < 5:
+        return []
+
+    dev = deviation_pct / 100.0
+    pivots: List[Pivot] = []
+
+    first_t = df.index[0]
+    first_high = float(df.iloc[0]["high"])
+    first_low = float(df.iloc[0]["low"])
+
+    last_pivot_price = (first_high + first_low) / 2.0
+    last_pivot_time = first_t
+
+    direction = None
+    extreme_price = last_pivot_price
+    extreme_time = first_t
+
+    for i in range(1, len(df)):
+        t = df.index[i]
+        high = float(df.iloc[i]["high"])
+        low = float(df.iloc[i]["low"])
+
+        if direction is None:
+            if high >= last_pivot_price * (1.0 + dev):
+                direction = "UP"
+                extreme_price = high
+                extreme_time = t
+            elif low <= last_pivot_price * (1.0 - dev):
+                direction = "DOWN"
+                extreme_price = low
+                extreme_time = t
+            continue
+
+        if direction == "UP":
+            if high >= extreme_price:
+                extreme_price = high
+                extreme_time = t
+            reversal_level = extreme_price * (1.0 - dev)
+            if low <= reversal_level:
+                pivots.append(Pivot(time=extreme_time, price=extreme_price,
+                                    kind="HIGH", confirmed_time=t))
+                last_pivot_price = extreme_price
+                last_pivot_time = extreme_time
+                direction = "DOWN"
+                extreme_price = low
+                extreme_time = t
+        else:
+            if low <= extreme_price:
+                extreme_price = low
+                extreme_time = t
+            reversal_level = extreme_price * (1.0 + dev)
+            if high >= reversal_level:
+                pivots.append(Pivot(time=extreme_time, price=extreme_price,
+                                    kind="LOW", confirmed_time=t))
+                last_pivot_price = extreme_price
+                last_pivot_time = extreme_time
+                direction = "UP"
+                extreme_price = high
+                extreme_time = t
+
+    clean = []
+    for p in pivots:
+        if clean and p.time <= clean[-1].time:
+            continue
+        if clean and p.kind == clean[-1].kind:
+            if p.kind == "HIGH" and p.price > clean[-1].price:
+                clean[-1] = p
+            elif p.kind == "LOW" and p.price < clean[-1].price:
+                clean[-1] = p
+        else:
+            clean.append(p)
+
+    return clean
+
+
+# ======================================================================
+# ABCD / ЗОНЫ
+# ======================================================================
+
+def build_profitgate_zones(pivots: List[Pivot], min_expected_move_pct: float) -> List[Zone]:
+    zones: List[Zone] = []
+    if len(pivots) < 3:
+        return zones
+
+    zone_id = 0
+    for i in range(2, len(pivots)):
+        a = pivots[i - 2]
+        b = pivots[i - 1]
+        c = pivots[i]
+
+        if not (a.time < b.time < c.time):
+            continue
+        if not (a.kind != b.kind and b.kind != c.kind and a.kind == c.kind):
+            continue
+
+        ab = b.price - a.price
+        impulse = abs(ab)
+        if impulse <= 0:
+            continue
+
+        d = c.price + ab
+        zone_half = impulse * ZONE_HALF_WIDTH_RATIO
+
+        if a.kind == "HIGH" and b.kind == "LOW" and c.kind == "HIGH":
+            direction = "BUY"
+            entry_mid = d
+            entry_low = d - zone_half
+            entry_high = d + zone_half
+            bc = c.price - b.price
+            exit_center = c.price + EXIT_EXTENSION_RATIO * bc
+            exit_half = impulse * ZONE_HALF_WIDTH_RATIO
+            exit_low = exit_center - exit_half
+            exit_high = exit_center + exit_half
+        elif a.kind == "LOW" and b.kind == "HIGH" and c.kind == "LOW":
+            direction = "SELL"
+            entry_mid = d
+            entry_low = d - zone_half
+            entry_high = d + zone_half
+            bc = b.price - c.price
+            exit_center = c.price - EXIT_EXTENSION_RATIO * bc
+            exit_half = impulse * ZONE_HALF_WIDTH_RATIO
+            exit_low = exit_center - exit_half
+            exit_high = exit_center + exit_half
+        else:
+            continue
+
+        if direction == "BUY":
+            move_pct = (exit_center / entry_mid - 1.0) * 100.0
+        else:
+            move_pct = (1.0 - exit_center / entry_mid) * 100.0
+
+        if move_pct < min_expected_move_pct:
+            continue
+
+        zone_id += 1
+        zones.append(Zone(
+            zone_id=zone_id,
+            a_time=a.time, a_price=a.price,
+            b_time=b.time, b_price=b.price,
+            c_time=c.time, c_price=c.price,
+            c_confirmed_time=c.confirmed_time,
+            d_price=d,
+            entry_low=entry_low, entry_high=entry_high, entry_mid=entry_mid,
+            exit_center=exit_center, exit_low=exit_low, exit_high=exit_high,
+            direction=direction, impulse_ab=impulse, move_from_entry_pct=move_pct,
+        ))
+
+    return zones
+
+
+# ======================================================================
+# CAUSAL LIFE-CYCLE ЗОН (invalidation ПО CLOSE)
+# ======================================================================
+
+def mark_broken_zones_causally(df: pd.DataFrame, zones: List[Zone]):
+    if not zones:
+        return
+    for t, row in df.iterrows():
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
+        for z in zones:
+            if z.broken_time is not None:
+                continue
+            if t < z.c_confirmed_time:
+                continue
+            if z.direction == "BUY":
+                if close < z.entry_low:
+                    z.broken_time = t
+            else:
+                if close > z.entry_high:
+                    z.broken_time = t
+
+
+def latest_active_buy_zone(zones: List[Zone], t: pd.Timestamp,
+                           low: float, high: float) -> Optional[Zone]:
+    candidates = []
+    for z in zones:
+        if z.direction != "BUY":
+            continue
+        if t < z.c_confirmed_time:
+            continue
+        if z.broken_time is not None and t >= z.broken_time:
+            continue
+        if high >= z.entry_low and low <= z.entry_high:
+            candidates.append(z)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x.c_confirmed_time)
+    return candidates[-1]
+
+
+# ======================================================================
+# ИЗДЕРЖКИ / ИСПОЛНЕНИЕ
+# ======================================================================
+
+def apply_entry_cost(price: float, direction: str) -> float:
+    total = (SLIPPAGE_PCT_PER_SIDE + SPREAD_PCT_PER_SIDE) / 100.0
+    if direction == "BUY":
+        return price * (1.0 + total)
+    return price * (1.0 - total)
+
+
+def apply_exit_cost(price: float, direction: str) -> float:
+    slip = (SLIPPAGE_PCT_PER_SIDE + SPREAD_PCT_PER_SIDE) / 100.0
+    if direction == "BUY":
+        return price * (1.0 - slip)
+    return price * (1.0 + slip)
+
+
+def trade_return_pct(entry_raw: float, exit_raw: float, direction: str) -> float:
+    entry = apply_entry_cost(entry_raw, direction)
+    exit_ = apply_exit_cost(exit_raw, direction)
+    if direction == "BUY":
+        gross = (exit_ - entry) / entry * 100.0
+    else:
+        gross = (entry - exit_) / entry * 100.0
+    return gross - 2.0 * COMMISSION_PCT_PER_SIDE
+
+
+# ======================================================================
+# BACKTEST V2.6
+# ======================================================================
+
+def backtest(df: pd.DataFrame, zones: List[Zone],
+             start_time: pd.Timestamp, end_time: pd.Timestamp) -> pd.DataFrame:
+    """
+    V2.6: единый трейлинг-стоп (с 0.30) вместо связки BE+trail;
+          после TP1 раннер дышит шире (0.25) с floor=BE;
+          верхний фильтр волатильности MAX_ATR_RATIO;
+          hard-стоп внутрибарно, soft-стопы по close (V2.5).
+    """
+    REJECT_COUNTER.clear()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    trades: List[Dict] = []
+    position = None
+    pending = None
+    last_signal_pos = -10**9
+    last_loss_pos = -10**9
+
+    RT_COST = 2.0 * (COMMISSION_PCT_PER_SIDE + SPREAD_PCT_PER_SIDE + SLIPPAGE_PCT_PER_SIDE)
+
+    def close_trade(pos, exit_t, exit_price_raw, reason, locked_pnl=None):
+        nonlocal last_loss_pos
+        ep = pos["entry_price_raw"]
+        if locked_pnl is not None:
+            pnl = (TP1_WEIGHT * locked_pnl
+                   + (1.0 - TP1_WEIGHT) * trade_return_pct(ep, exit_price_raw, "BUY"))
+        else:
+            pnl = trade_return_pct(ep, exit_price_raw, "BUY")
+        held = pos["cur_pos"] - pos["entry_pos"]
+        trades.append({
+            "direction": "BUY", "zone_id": pos["zone_id"],
+            "signal_time": pos["signal_time"], "entry_time": pos["entry_time"],
+            "entry_price": ep, "d_projection": pos["d_price"],
+            "entry_zone_low": pos["entry_zone_low"], "entry_zone_high": pos["entry_zone_high"],
+            "entry_zone_mid": pos["entry_zone_mid"], "stop_price": pos["stop_price"],
+            "hard_stop": pos["hard_stop"],
+            "exit_zone_center": pos["exit_zone_center"], "exit_zone_low": pos["exit_zone_low"],
+            "exit_zone_high": pos["exit_zone_high"], "exit_time": exit_t,
+            "exit_price": exit_price_raw, "target_price": pos["target_price"],
+            "tp1_price": pos["tp1_price"], "tp1_done": pos["tp1_done"],
+            "expected_move_pct": pos["expected_move_pct"],
+            "pnl_pct": pnl, "mfe_pct": pos["mfe"], "mae_pct": pos["mae"],
+            "bars_held": held, "minutes_held": held * BAR_MINUTES,
+            "reason": reason, "volume_ratio": pos["volume_ratio"], "atr_ratio": pos["atr_ratio"],
+            "a_time": pos["a_time"], "b_time": pos["b_time"], "c_time": pos["c_time"],
+            "a_price": pos["a_price"], "b_price": pos["b_price"], "c_price": pos["c_price"],
+            "impulse_ab": pos["impulse_ab"],
+        })
+        if pnl < LOSS_EPS_PCT:          # scratch не убыток
+            last_loss_pos = pos["cur_pos"]
+        return pnl
+
+    for i in range(1, len(df)):
+        t = df.index[i]
+        if t > end_time:
+            break
+
+        row = df.iloc[i]
+        high, low = float(row["high"]), float(row["low"])
+        open_, close = float(row["open"]), float(row["close"])
+        atr_raw = float(row.get("atr", np.nan))
+        atr = atr_raw if np.isfinite(atr_raw) else np.nan
+
+        # ================= СОПРОВОЖДЕНИЕ ПОЗИЦИИ =================
+        if position is not None:
+            position["cur_pos"] = i
+            ep = position["entry_price_raw"]
+            position["mfe"] = max(position["mfe"], (high - ep) / ep * 100.0)
+            position["mae"] = min(position["mae"], (low - ep) / ep * 100.0)
+
+            # ----------------------------------------------------------
+            # V2.6: единый трейлинг-стоп вместо связки BE+trail.
+            #   до TP1: back = TRAIL_BACK_PCT (0.15), стоп только растёт;
+            #   после TP1: back = RUNNER_TRAIL_BACK_PCT (0.25), но floor=BE —
+            #   раннер дышит шире, однако не уходит в минус после фиксации.
+            # ----------------------------------------------------------
+            if USE_TRAILING_STOP and position["mfe"] >= TRAIL_TRIGGER_PCT:
+                mfe_high_price = ep * (1.0 + position["mfe"] / 100.0)
+                if position["tp1_done"]:
+                    runner_floor = ep * (1.0 + RT_COST / 100.0)
+                    trail_stop = max(mfe_high_price * (1.0 - RUNNER_TRAIL_BACK_PCT / 100.0),
+                                     runner_floor)
+                    position["stop_price"] = trail_stop   # допустимо понижение до floor
+                else:
+                    trail_stop = mfe_high_price * (1.0 - TRAIL_BACK_PCT / 100.0)
+                    if trail_stop > position["stop_price"]:
+                        position["stop_price"] = trail_stop
+                position["trail_on"] = True
+
+            # A/B-переключатель: плоский BE (по умолчанию выключен в V2.6)
+            if USE_BREAKEVEN:
+                be_price = ep * (1.0 + RT_COST / 100.0)
+                if not position["be_on"] and position["mfe"] >= BREAKEVEN_TRIGGER_PCT:
+                    position["stop_price"] = max(position["stop_price"], be_price)
+                    position["be_on"] = True
+
+            # ----------------------------------------------------------
+            # V2.5: hard-стоп (зонный) — внутрибарно; soft (BE/trail) — по close.
+            # ----------------------------------------------------------
+            is_hard = position["stop_price"] <= position["hard_stop"] + 1e-9
+            if is_hard:
+                stop_hit = low <= position["stop_price"]
+            else:
+                stop_hit = close <= position["stop_price"]
+
+            tp1_hit = USE_TP1 and not position["tp1_done"] and high >= position["tp1_price"]
+            runner_target = USE_TP1 and USE_PARTIAL_TP and position["tp1_done"] and high >= position["target_price"]
+            legacy_target = (not USE_TP1) and high >= position["target_price"]
+            timeout = (i - position["entry_pos"]) >= MAX_HOLD_BARS
+
+            if stop_hit:
+                exit_px = position["stop_price"] if is_hard else close
+                if position["tp1_done"]:
+                    reason = ("RUNNER_TRAIL_STOP" if position["trail_on"]
+                              else ("RUNNER_BE_STOP" if position["be_on"]
+                                    else "RUNNER_INVALIDATION"))
+                    close_trade(position, t, exit_px, reason,
+                                locked_pnl=position["locked_pnl"])
+                else:
+                    reason = ("TRAIL_STOP" if position["trail_on"]
+                              else ("BE_STOP" if position["be_on"]
+                                    else "ZONE_INVALIDATION"))
+                    close_trade(position, t, exit_px, reason)
+                position = None
+            elif tp1_hit:
+                if USE_PARTIAL_TP:
+                    position["tp1_done"] = True
+                    position["locked_pnl"] = trade_return_pct(ep, position["tp1_price"], "BUY")
+                    # V2.6: здесь НЕ ставим BE принудительно — трейлинг с 0.30
+                    # уже активен (MFE>=0.80), на след. баре пересчитается с
+                    # runner-back и floor=BE.
+                else:
+                    close_trade(position, t, position["tp1_price"], "TP1")
+                    position = None
+            elif runner_target or legacy_target:
+                if position["tp1_done"]:
+                    close_trade(position, t, position["target_price"], "RUNNER_TARGET",
+                                locked_pnl=position["locked_pnl"])
+                else:
+                    close_trade(position, t, position["target_price"], "EXIT_ZONE")
+                position = None
+            elif timeout:
+                if position["tp1_done"]:
+                    close_trade(position, t, close, "RUNNER_TIMEOUT",
+                                locked_pnl=position["locked_pnl"])
+                else:
+                    close_trade(position, t, close, "TIMEOUT")
+                position = None
+
+            if position is not None:
+                continue
+
+        # ================= РАБОТА С ОТСЛОЖЕННЫМ BUY-STOP =================
+        if position is None and pending is not None:
+            if i > pending["expiry_pos"]:
+                REJECT_COUNTER["pending_expired"] += 1
+                pending = None
+            elif close <= pending["stop_price"]:
+                REJECT_COUNTER["pending_invalidated"] += 1
+                pending = None
+            elif high >= pending["stop_level"]:
+                rng = high - low
+                trig_loc = (close - low) / rng if rng > 0 else 0.0
+                confirmed = (close > open_) and (trig_loc >= MIN_TRIGGER_CLOSE_LOCATION)
+
+                if REQUIRE_BULLISH_TRIGGER and not confirmed:
+                    REJECT_COUNTER["trigger_not_confirmed"] += 1
+                else:
+                    z = pending["zone"]
+                    entry_raw = max(open_, pending["stop_level"])
+                    exp_move = (z.exit_center / entry_raw - 1.0) * 100.0
+                    tp1_price = entry_raw * (1.0 + TP1_PCT / 100.0)
+                    reward = (min(tp1_price, z.exit_center) - entry_raw) / entry_raw * 100.0 if USE_TP1 \
+                        else (z.exit_center - entry_raw) / entry_raw * 100.0
+                    risk = (entry_raw - pending["stop_price"]) / entry_raw * 100.0
+
+                    ok = (entry_raw < z.exit_low
+                          and exp_move >= MIN_EXPECTED_MOVE_PCT + MIN_EXPECTED_MOVE_BUFFER_PCT
+                          and risk > 0 and reward / risk >= MIN_REWARD_RISK)
+
+                    if ok:
+                        position = {
+                            "zone_id": z.zone_id, "signal_time": pending["signal_time"],
+                            "entry_time": t, "entry_pos": i, "cur_pos": i,
+                            "entry_price_raw": entry_raw, "d_price": z.d_price,
+                            "entry_zone_low": z.entry_low, "entry_zone_high": z.entry_high,
+                            "entry_zone_mid": z.entry_mid,
+                            "stop_price": pending["stop_price"],
+                            "hard_stop": pending["stop_price"],
+                            "exit_zone_center": z.exit_center, "exit_zone_low": z.exit_low,
+                            "exit_zone_high": z.exit_high, "target_price": z.exit_center,
+                            "tp1_price": tp1_price, "tp1_done": False,
+                            "be_on": False, "trail_on": False,
+                            "locked_pnl": None, "expected_move_pct": exp_move,
+                            "mfe": 0.0, "mae": 0.0,
+                            "volume_ratio": pending["volume_ratio"], "atr_ratio": pending["atr_ratio"],
+                            "a_time": z.a_time, "b_time": z.b_time, "c_time": z.c_time,
+                            "a_price": z.a_price, "b_price": z.b_price, "c_price": z.c_price,
+                            "impulse_ab": z.impulse_ab,
+                        }
+                        z.used = True
+                    else:
+                        REJECT_COUNTER["rr_fail"] += 1
+                    pending = None
+
+        # ================= ПОИСК НОВОГО СИГНАЛА =================
+        if position is None:
+            if t < start_time or t > end_time:
+                continue
+            if i - last_signal_pos < MIN_DISTANCE_BARS:
+                REJECT_COUNTER["cooldown"] += 1
+                continue
+            if i - last_loss_pos < LOSS_COOLDOWN_BARS:
+                REJECT_COUNTER["loss_cooldown"] += 1
+                continue
+
+            zone = latest_active_buy_zone(zones, t, low, high)
+            if zone is None or zone.used:
+                REJECT_COUNTER["no_live_zone"] += 1
+                continue
+
+            # V2.4: глубокое касание — только нижняя половина зоны
+            if USE_DEEP_TOUCH and low > zone.entry_mid:
+                REJECT_COUNTER["shallow_touch"] += 1
+                continue
+
+            vr = float(row.get("volume_ratio", np.nan))
+            ar = float(row.get("atr_ratio", np.nan))
+            if USE_BOUNCE_CONFIRMATION:
+                if MIN_VOLUME_RATIO > 0:
+                    if not np.isfinite(vr) or vr < MIN_VOLUME_RATIO:
+                        REJECT_COUNTER["volume"] += 1
+                        continue
+                if MIN_ATR_RATIO > 0:
+                    if not np.isfinite(ar) or ar < MIN_ATR_RATIO:
+                        REJECT_COUNTER["atr"] += 1
+                        continue
+                # V2.6: верхняя граница волатильности — mean-reversion не
+                # работает в краховых режимах (дни 05.09, 09.09, 15-16.09)
+                if MAX_ATR_RATIO > 0:
+                    if not np.isfinite(ar) or ar > MAX_ATR_RATIO:
+                        REJECT_COUNTER["atr_too_high"] += 1
+                        continue
+
+            if i >= CRASH_ROC_BARS:
+                roc = (close / float(df["close"].iloc[i - CRASH_ROC_BARS]) - 1.0) * 100.0
+                if roc < CRASH_ROC_LIMIT_PCT:
+                    REJECT_COUNTER["crash_guard"] += 1
+                    continue
+
+            if ZONE_MAX_AGE_MIN > 0:
+                if (t - zone.c_confirmed_time) > pd.Timedelta(minutes=ZONE_MAX_AGE_MIN):
+                    REJECT_COUNTER["zone_age"] += 1
+                    continue
+
+            if pending is not None:
+                if not (ALLOW_PENDING_REPLACE
+                        and zone.c_confirmed_time > pending["zone"].c_confirmed_time):
+                    REJECT_COUNTER["pending_keep"] += 1
+                    continue
+
+            stop_price = zone.entry_low * (1.0 - STOP_BUFFER_PCT / 100.0)
+            if USE_ATR_STOP_BUFFER and np.isfinite(atr):
+                stop_price -= ATR_STOP_MULTIPLIER * atr
+
+            if USE_BUY_STOP_ENTRY:
+                stop_level = zone.entry_mid          # V2.4: триггер на возврате mid
+                expiry = i + BUY_STOP_EXPIRY_BARS
+            else:
+                stop_level, expiry = -1e9, i + 1
+
+            pending = {
+                "zone": zone, "signal_time": t, "sig_pos": i,
+                "stop_level": stop_level, "stop_price": stop_price,
+                "expiry_pos": expiry, "volume_ratio": vr, "atr_ratio": ar,
+            }
+            last_signal_pos = i
+
+    # ================= ЗАКРЫТИЕ НА ГРАНИЦЕ ПЕРИОДА =================
+    if position is not None:
+        valid = np.where((df.index >= position["entry_time"]) & (df.index <= end_time))[0]
+        if len(valid) > 0:
+            final_i = int(valid[-1])
+            position["cur_pos"] = final_i
+            locked = position["locked_pnl"] if position["tp1_done"] else None
+            close_trade(position, df.index[final_i], float(df.iloc[final_i]["close"]),
+                        "RUNNER_END_OF_PERIOD" if position["tp1_done"] else "END_OF_SELECTED_PERIOD",
+                        locked_pnl=locked)
+
+    return pd.DataFrame(trades)
+
+
+# ======================================================================
+# СТАТИСТИКА
+# ======================================================================
+
+def calculate_metrics(trades: pd.DataFrame) -> Dict:
+    if trades.empty:
+        return {
+            "trades": 0, "win_rate": 0.0, "avg_pnl": 0.0, "sum_pnl": 0.0,
+            "compound_return": 0.0, "profit_factor": 0.0, "max_drawdown": 0.0,
+            "avg_expected_move": 0.0, "median_expected_move": 0.0, "avg_hold_min": 0.0,
+        }
+
+    pnl = trades["pnl_pct"].astype(float)
+    equity = (1.0 + pnl / 100.0).cumprod()
+    peak = equity.cummax()
+    dd = (equity / peak - 1.0) * 100.0
+
+    wins = pnl > 0
+    gross_profit = pnl[wins].sum()
+    gross_loss = abs(pnl[~wins].sum())
+    pf = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+    return {
+        "trades": int(len(trades)),
+        "wins": int(wins.sum()),
+        "losses": int((~wins).sum()),
+        "win_rate": float(wins.mean() * 100.0),
+        "avg_pnl": float(pnl.mean()),
+        "median_pnl": float(pnl.median()),
+        "sum_pnl": float(pnl.sum()),
+        "compound_return": float((equity.iloc[-1] - 1.0) * 100.0),
+        "profit_factor": float(pf),
+        "max_drawdown": float(dd.min()),
+        "max_win": float(pnl.max()),
+        "max_loss": float(pnl.min()),
+        "avg_expected_move": float(trades["expected_move_pct"].mean()),
+        "median_expected_move": float(trades["expected_move_pct"].median()),
+        "avg_hold_min": float(trades["minutes_held"].mean()),
+        "exit_zone_count": int(trades["reason"].eq("EXIT_ZONE").sum()),
+        "tp1_count": int(trades["tp1_done"].sum()),
+        "trail_stop_count": int(trades["reason"].isin(["TRAIL_STOP", "RUNNER_TRAIL_STOP"]).sum()),
+        "be_stop_count": int(trades["reason"].isin(["BE_STOP", "RUNNER_BE_STOP"]).sum()),
+        "invalidation_count": int(trades["reason"].isin(
+            ["ZONE_INVALIDATION", "RUNNER_INVALIDATION"]).sum()),
+    }
+
+
+def print_stats(trades: pd.DataFrame):
+    print("\n" + "=" * 100)
+    print(" NVTK ProfitGate V2.6 — ABCD / ZigZag / BUY ONLY / +0.80%")
+    print("=" * 100)
+    print(f"Deviation ZigZag:       {DEVIATION_PCT:.2f}%")
+    print(f"Zone half width:        {ZONE_HALF_WIDTH_RATIO:.2f} × AB")
+    print(f"Exit extension:         {EXIT_EXTENSION_RATIO:.2f} × BC")
+    print(f"Минимальное движение:   {MIN_EXPECTED_MOVE_PCT:.2f}%")
+    print(f"TP1:                    +{TP1_PCT:.2f}% (вес {TP1_WEIGHT:.0%})")
+    print(f"Breakeven (V2.6):       {'ON' if USE_BREAKEVEN else 'OFF (заменён трейлингом)'}")
+    print(f"Trailing:               с MFE +{TRAIL_TRIGGER_PCT:.2f}%, back {TRAIL_BACK_PCT:.2f}% "
+          f"/ после TP1 {RUNNER_TRAIL_BACK_PCT:.2f}% (floor=BE)")
+    print(f"ATR стоп multiplier:    {ATR_STOP_MULTIPLIER:.2f}")
+    print(f"ATR ratio фильтр:       [{MIN_ATR_RATIO:.2f} .. {MAX_ATR_RATIO:.2f}] (V2.6: верх = нет входа в краш)")
+    print(f"Invalidation зоны:      ПО CLOSE")
+    print(f"V2.5 стопы:             hard — внутрибарно, soft (trail) — по CLOSE")
+    print(f"Подтверждение:          бычий ТРИГГЕР-бар (close в верхней {1-MIN_TRIGGER_CLOSE_LOCATION:.0%})")
+    print(f"Loss epsilon:           {LOSS_EPS_PCT:.2f}% (scratch не убыток)")
+    print(f"Комиссия / сторона:     {COMMISSION_PCT_PER_SIDE:.3f}%")
+    print(f"Spread / сторона:       {SPREAD_PCT_PER_SIDE:.3f}%")
+    print(f"Slippage / сторона:     {SLIPPAGE_PCT_PER_SIDE:.3f}%")
+    print("-" * 100)
+
+    if trades.empty:
+        print("Сделок нет.")
+        return
+
+    m = calculate_metrics(trades)
+    for k, v in m.items():
+        if isinstance(v, float):
+            print(f"{k:24s}: {v:+.4f}")
+        else:
+            print(f"{k:24s}: {v}")
+
+    print("\nПричины выхода:")
+    print(trades["reason"].value_counts().to_string())
+
+    print("\nРаспределение ожидаемого движения:")
+    print(trades["expected_move_pct"].describe().to_string())
+
+    if "mfe_pct" in trades.columns:
+        print("\nMFE / MAE (диагностика достижимости +0.80%):")
+        print(f"  сделок с MFE >= {TP1_PCT:.2f}% : "
+              f"{int((trades['mfe_pct'] >= TP1_PCT).sum())} из {len(trades)}")
+        print(f"  сделок с MFE >= {TRAIL_TRIGGER_PCT:.2f}% : "
+              f"{int((trades['mfe_pct'] >= TRAIL_TRIGGER_PCT).sum())} из {len(trades)}")
+        print(f"  средний MFE: {trades['mfe_pct'].mean():+.3f}% | "
+              f"средний MAE: {trades['mae_pct'].mean():+.3f}%")
+        print(f"  TP1 зафиксирован: {int(trades['tp1_done'].sum())} сделок")
+        mean_mfe = trades["mfe_pct"].mean()
+        if mean_mfe > 0:
+            print(f"  конверсия MFE->PnL: {trades['pnl_pct'].mean() / mean_mfe:.2f}")
+
+
+# ======================================================================
+# ГРАФИК
+# ======================================================================
+
+def draw_zone(ax, x1, x2, low, high, color, alpha, label=None):
+    ax.fill_between([x1, x2], [low, low], [high, high],
+                    color=color, alpha=alpha, label=label, zorder=1)
+
+
+def plot_profitgate(df: pd.DataFrame, zones: List[Zone], trades: pd.DataFrame,
+                    start_time: pd.Timestamp, end_time: pd.Timestamp):
+    start_time = pd.Timestamp(start_time)
+    end_time = pd.Timestamp(end_time)
+    if start_time.tzinfo is None:
+        start_time = start_time.tz_localize(MSK_TZ)
+    else:
+        start_time = start_time.tz_convert(MSK_TZ)
+    if end_time.tzinfo is None:
+        end_time = end_time.tz_localize(MSK_TZ)
+    else:
+        end_time = end_time.tz_convert(MSK_TZ)
+
+    chart_df = df.copy()
+    chart_df.index = pd.DatetimeIndex(chart_df.index)
+    if chart_df.index.tz is None:
+        chart_df.index = chart_df.index.tz_localize(MSK_TZ)
+    else:
+        chart_df.index = chart_df.index.tz_convert(MSK_TZ)
+    chart_df = chart_df.loc[(chart_df.index >= start_time) & (chart_df.index <= end_time)].copy()
+
+    if chart_df.empty:
+        print("❌ В выбранном периоде нет свечей для графика.")
+        return
+
+    logger.info("📊 ОКНО ГРАФИКА: %s → %s МСК | свечей: %d",
+                chart_df.index.min().strftime("%d.%m.%Y %H:%M"),
+                chart_df.index.max().strftime("%d.%m.%Y %H:%M"), len(chart_df))
+
+    fig, ax = plt.subplots(figsize=(22, 11))
+    ax.plot(chart_df.index, chart_df["close"], linewidth=0.9, color="black",
+            label="NVTK close", zorder=5)
+
+    visible = []
+    for z in zones:
+        zone_start = z.c_confirmed_time
+        zone_end = z.broken_time if z.broken_time is not None else end_time
+        if zone_end < start_time or zone_start > end_time:
+            continue
+        visible.append(z)
+    visible.sort(key=lambda z: z.c_confirmed_time)
+    if MAX_VISIBLE_ZONES > 0:
+        visible = visible[-MAX_VISIBLE_ZONES:]
+
+    for z in visible:
+        x1 = max(z.c_confirmed_time, start_time)
+        x2 = end_time if z.broken_time is None else min(z.broken_time, end_time)
+        if x2 <= x1:
+            continue
+
+        if z.direction == "BUY" and SHOW_BUY_ZONES:
+            ax.fill_between([x1, x2], [z.entry_low, z.entry_low], [z.entry_high, z.entry_high],
+                            color="green", alpha=0.20, zorder=1)
+            ax.plot([x1, x2], [z.entry_mid, z.entry_mid], color="green",
+                    linestyle="--", linewidth=0.9, alpha=0.85)
+            ax.annotate(f"BUY zone #{z.zone_id}\nD={z.d_price:.2f}\nожид. +{z.move_from_entry_pct:.2f}%",
+                        (x1, z.entry_mid), xytext=(5, 5), textcoords="offset points",
+                        fontsize=7, color="green")
+
+        if z.direction == "BUY" and SHOW_SELL_ZONES:
+            ax.fill_between([x1, x2], [z.exit_low, z.exit_low], [z.exit_high, z.exit_high],
+                            color="red", alpha=0.13, zorder=1)
+            ax.plot([x1, x2], [z.exit_center, z.exit_center], color="red",
+                    linestyle="--", linewidth=0.9, alpha=0.80)
+            ax.annotate(f"EXIT zone\n{z.exit_center:.2f}", (x1, z.exit_center),
+                        xytext=(5, -14), textcoords="offset points", fontsize=7, color="red")
+
+        if SHOW_PROJECTION_LINES and z.direction == "BUY":
+            points = [(z.a_time, z.a_price, "A"), (z.b_time, z.b_price, "B"), (z.c_time, z.c_price, "C")]
+            visible_points = [p for p in points if start_time <= p[0] <= end_time]
+            if len(visible_points) >= 2:
+                ax.plot([p[0] for p in visible_points], [p[1] for p in visible_points],
+                        color="purple", linewidth=1.0, alpha=0.75, zorder=6)
+            for pt, price, label in visible_points:
+                ax.scatter([pt], [price], color="purple", s=22, zorder=8)
+                ax.annotate(label, (pt, price), xytext=(4, 4), textcoords="offset points",
+                            fontsize=8, color="purple")
+            if start_time <= z.c_time <= end_time:
+                ax.scatter([z.c_time], [z.d_price], color="green", s=35, zorder=9)
+                ax.annotate("D", (z.c_time, z.d_price), xytext=(4, -10),
+                            textcoords="offset points", fontsize=8, color="green")
+                ax.plot([z.c_time, x2], [z.c_price, z.d_price], color="purple",
+                        linestyle=":", linewidth=0.8, alpha=0.65)
+
+    if not trades.empty:
+        tr = trades[(pd.to_datetime(trades["entry_time"]) >= start_time)
+                    & (pd.to_datetime(trades["entry_time"]) <= end_time)].copy()
+        for _, trade in tr.iterrows():
+            et, xt = trade["entry_time"], trade["exit_time"]
+            ax.scatter([et], [trade["entry_price"]], marker="^", s=105, color="green",
+                       edgecolor="black", zorder=15)
+            ax.scatter([xt], [trade["exit_price"]], marker="v", s=105, color="red",
+                       edgecolor="black", zorder=15)
+            ax.plot([et, xt], [trade["entry_price"], trade["exit_price"]],
+                    color="green" if trade["pnl_pct"] > 0 else "red",
+                    linewidth=1.0, alpha=0.70, zorder=10)
+            if SHOW_ENTRY_TARGET_LINES:
+                ax.plot([et, et], [trade["entry_price"], trade["exit_zone_center"]],
+                        color="red", linestyle=":", linewidth=0.8, alpha=0.60)
+                if USE_ZONE_INVALIDATION:
+                    ax.plot([et, xt], [trade["hard_stop"], trade["hard_stop"]],
+                            color="red", linestyle=":", linewidth=0.6, alpha=0.35)
+            mfe_str = f"MFE +{trade['mfe_pct']:.2f}%" if 'mfe_pct' in trade and pd.notna(trade['mfe_pct']) else ""
+            ax.annotate(f"BUY\nожид. +{trade['expected_move_pct']:.2f}%\n"
+                        f"результат {trade['pnl_pct']:+.2f}%\n{mfe_str}",
+                        (et, trade["entry_price"]), xytext=(5, 7),
+                        textcoords="offset points", fontsize=7)
+
+    ax.set_autoscalex_on(False)
+    ax.set_xlim(start_time.to_pydatetime(), end_time.to_pydatetime())
+    ax.set_title(
+        f"NVTK — ProfitGate V2.6 ABCD\n"
+        f"ТОЛЬКО выбранный период: {start_time:%d.%m.%Y %H:%M} → {end_time:%d.%m.%Y %H:%M} МСК\n"
+        f"ZigZag {DEVIATION_PCT:.2f}% | мин. движение +{MIN_EXPECTED_MOVE_PCT:.2f}% | "
+        f"TP1 +{TP1_PCT:.2f}% | Trail {TRAIL_BACK_PCT:.2f}/{RUNNER_TRAIL_BACK_PCT:.2f}% | "
+        f"ATR<= {MAX_ATR_RATIO:.2f} | soft-stops по CLOSE",
+        fontsize=13)
+    ax.set_xlabel("Время, МСК")
+    ax.set_ylabel("Цена, ₽")
+    ax.grid(True, alpha=0.22)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%m %H:%M", tz=MSK_TZ))
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    ax.set_autoscalex_on(False)
+    ax.set_xlim(start_time.to_pydatetime(), end_time.to_pydatetime())
+
+    if SAVE_PNG:
+        filename = (f"NVTK_ProfitGate_V2.6_{start_time:%Y%m%d_%H%M}_{end_time:%Y%m%d_%H%M}.png")
+        plt.savefig(filename, dpi=150, bbox_inches="tight")
+        logger.info("График выбранного периода сохранён: %s", filename)
+    plt.show()
+
+
+# ======================================================================
+# CSV
+# ======================================================================
+
+def save_outputs(trades: pd.DataFrame, zones: List[Zone]):
+    if not SAVE_CSV:
+        return
+    if not trades.empty:
+        trades.to_csv("NVTK_ProfitGate_V2.6_trades.csv", index=False, encoding="utf-8-sig")
+    if zones:
+        zone_rows = []
+        for z in zones:
+            row = asdict(z)
+            for k, v in row.items():
+                if isinstance(v, pd.Timestamp):
+                    row[k] = v.isoformat()
+            zone_rows.append(row)
+        pd.DataFrame(zone_rows).to_csv("NVTK_ProfitGate_V2.6_zones.csv",
+                                       index=False, encoding="utf-8-sig")
+    logger.info("CSV-файлы сохранены.")
+
+
+# ======================================================================
+# MAIN
+# ======================================================================
+
+def main():
+    print("\n" + "=" * 100)
+    print(" NVTK ProfitGate V2.6 BACKTEST — ABCD / ZIGZAG")
+    print("=" * 100)
+    print("Зелёная зона  = потенциальный BUY")
+    print("Красная зона   = проектируемая EXIT/SELL зона")
+    print("Режим торговли = только BUY")
+    print(f"Минимальное ожидаемое движение = {MIN_EXPECTED_MOVE_PCT:.2f}%")
+    print(f"TP1 фиксация = +{TP1_PCT:.2f}% (вес {TP1_WEIGHT:.0%})")
+    print(f"V2.6: BE OFF, трейлинг с +{TRAIL_TRIGGER_PCT:.2f}% (back {TRAIL_BACK_PCT:.2f}%"
+          f" / после TP1 {RUNNER_TRAIL_BACK_PCT:.2f}%), ATR<= {MAX_ATR_RATIO:.2f}")
+    print(f"Invalidation зоны = ПО CLOSE; hard-стоп внутрибарно, soft — по CLOSE")
+    print("=" * 100)
+
+    if not TOKEN:
+        print("\n❌ Не найден T_INVEST_TOKEN.\n"
+              "В PowerShell задайте:\n$env:T_INVEST_TOKEN=\"ВАШ_ТОКЕН\"\n")
+        return
+
+    start_time, end_time = ask_period()
+    load_from = start_time - timedelta(days=WARMUP_DAYS)
+
+    print("\nПараметры:")
+    print(f"  Период:                  {start_time:%d.%m.%Y} → {end_time:%d.%m.%Y}")
+    print("  Таймфрейм:               5m")
+    print(f"  ZigZag deviation:        {DEVIATION_PCT:.2f}%")
+    print(f"  Zone half width:         {ZONE_HALF_WIDTH_RATIO:.2f} × AB")
+    print(f"  Exit extension:          {EXIT_EXTENSION_RATIO:.2f} × BC")
+    print(f"  Min expected move:       {MIN_EXPECTED_MOVE_PCT:.2f}%")
+    print(f"  TP1:                     +{TP1_PCT:.2f}% (вес {TP1_WEIGHT:.0%})")
+    print(f"  Breakeven (V2.6):        {'ON' if USE_BREAKEVEN else 'OFF'}")
+    print(f"  Trailing:                с MFE +{TRAIL_TRIGGER_PCT:.2f}% / back {TRAIL_BACK_PCT:.2f}%"
+          f" / после TP1 {RUNNER_TRAIL_BACK_PCT:.2f}%")
+    print(f"  ATR стоп:                ×{ATR_STOP_MULTIPLIER:.2f}")
+    print(f"  ATR ratio:               [{MIN_ATR_RATIO:.2f} .. {MAX_ATR_RATIO:.2f}]")
+    print(f"  Max hold:                {MAX_HOLD_MINUTES} мин")
+    print(f"  Commission / side:       {COMMISSION_PCT_PER_SIDE:.3f}%")
+    print(f"  Spread / side:           {SPREAD_PCT_PER_SIDE:.3f}%")
+    print(f"  Slippage / side:         {SLIPPAGE_PCT_PER_SIDE:.3f}%")
+    print(f"  Warmup:                  {WARMUP_DAYS} дней (только расчёт, НЕ график)")
+    print(f"  Min volume ratio:        {MIN_VOLUME_RATIO:.2f} (0=off)")
+    print(f"  Zone invalidation stop:  {USE_ZONE_INVALIDATION} (по CLOSE)")
+    print(f"  Buy-stop entry:          {USE_BUY_STOP_ENTRY}")
+    print(f"  Buy-stop expiry:         {BUY_STOP_EXPIRY_BARS*BAR_MINUTES} мин")
+    print(f"  Crash guard:             {CRASH_ROC_LIMIT_PCT:.2f}% за {CRASH_ROC_BARS*BAR_MINUTES} мин")
+    print(f"  Loss cooldown:           {LOSS_COOLDOWN_BARS*BAR_MINUTES} мин (eps {LOSS_EPS_PCT:.2f}%)")
+    print(f"  Zone max age:            {ZONE_MAX_AGE_MIN} мин (0=off)")
+    print(f"  Min reward/risk:         {MIN_REWARD_RISK:.2f}")
+    print(f"  Deep touch:              {USE_DEEP_TOUCH}")
+    print()
+    print("Исполнение:")
+    print("  Касание зоны (любая свеча, нижняя половина) -> BUY-STOP на entry_mid")
+    print("  Триггер: бычий бар с close в верхней 60% -> вход max(open, stop)")
+    print("  Target = центр красной projected EXIT zone")
+    print("  TP1 = +0.80% (50% позиции), остаток -> EXIT zone")
+    print("  V2.6: трейлинг с +0.30%; после TP1 раннер back 0.25 с floor=BE")
+    print("  V2.6: нет входа при ATR ratio > 2.50 (краховые дни)")
+    print("  SELL не открывается")
+
+    logger.info("🚀 Загружаем историю...")
+    candles = load_history(FIGI, load_from, end_time)
+    if not candles:
+        print("❌ API не вернул свечи.")
+        return
+
+    df = candles_to_df(candles)
+    if df.empty:
+        print("❌ DataFrame пуст.")
+        return
+
+    print(f"\n✅ Загружено 5m свечей всего: {len(df):,}")
+    print(f"   Из них выбранный период: {((df.index >= start_time) & (df.index <= end_time)).sum():,}")
+    print(f"   Технический прогрев: {(df.index < start_time).sum():,} свечей "
+          f"(не отображается и не входит в сделки)")
+
+    df = add_confirmation_features(df)
+
+    logger.info("🔎 Строим causal ZigZag, deviation %.2f%%...", DEVIATION_PCT)
+    pivots = build_causal_zigzag(df, DEVIATION_PCT)
+    logger.info("Подтверждено pivot: %d", len(pivots))
+    if len(pivots) < 3:
+        print("❌ Недостаточно pivot для ABCD.")
+        return
+
+    zones = build_profitgate_zones(pivots, MIN_EXPECTED_MOVE_PCT)
+    logger.info("Сформировано зон с ожидаемым движением >= %.2f%%: %d",
+                MIN_EXPECTED_MOVE_PCT, len(zones))
+
+    period_zones = [z for z in zones if z.c_confirmed_time <= end_time
+                    and (z.broken_time is None or z.broken_time >= start_time)]
+    logger.info("Зон, реально пересекающих выбранный период: %d", len(period_zones))
+
+    buy_zones = [z for z in zones if z.direction == "BUY"]
+    sell_zones = [z for z in zones if z.direction == "SELL"]
+    print(f"  BUY-зон:  {len(buy_zones)}")
+    print(f"  SELL-зон: {len(sell_zones)}")
+
+    mark_broken_zones_causally(df, zones)
+    trades = backtest(df, zones, start_time, end_time)
+
+    print_stats(trades)
+
+    print("\n" + "=" * 100)
+    print(" ОТКАЗЫ ФИЛЬТРОВ (диагностика)")
+    print("=" * 100)
+    if REJECT_COUNTER:
+        total_rejects = sum(REJECT_COUNTER.values())
+        print(f"  Всего отказов: {total_rejects}")
+        for k, v in REJECT_COUNTER.most_common():
+            print(f"    {k:24s}: {v:6d}  ({v / total_rejects * 100:5.1f}%)")
+    else:
+        print("  Нет отказов (все сигналы прошли фильтры)")
+
+    if not trades.empty:
+        trades["entry_time_dt"] = pd.to_datetime(trades["entry_time"])
+        monthly = (trades.set_index("entry_time_dt")
+                   .groupby(pd.Grouper(freq="ME"))["pnl_pct"]
+                   .agg(["count", "mean", "sum"]))
+        print("\n" + "=" * 100)
+        print(" ПОМЕСЯЧНАЯ СТАТИСТИКА")
+        print("=" * 100)
+        print(monthly.to_string())
+        trades.drop(columns=["entry_time_dt"], inplace=True)
+
+    save_outputs(trades, zones)
+    plot_profitgate(df, zones, trades, start_time, end_time)
+
+    print(f"\n📈 График построен СТРОГО за выбранный период: "
+          f"{start_time:%d.%m.%Y %H:%M} → {end_time:%d.%m.%Y %H:%M} МСК.")
+    print("   ВНИМАНИЕ: warmup используется только внутри расчёта ZigZag/зон "
+          "и физически исключён из области графика.")
+    print(f"   Warmup {WARMUP_DAYS} дней использован только для формирования "
+          f"причинного ZigZag и на графике отсутствует.")
+    print("\n" + "=" * 100)
+    print("Готово.")
+    print("=" * 100)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n⏹ Остановлено пользователем.")
+        sys.exit(0)
+    except Exception as exc:
+        logger.exception("Критическая ошибка: %s", exc)
+        sys.exit(1)
